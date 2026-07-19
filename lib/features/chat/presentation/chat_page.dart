@@ -1,0 +1,758 @@
+import 'dart:convert';
+
+import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:go_router/go_router.dart';
+import 'package:speech_to_text/speech_to_text.dart';
+import 'package:flutter_tts/flutter_tts.dart';
+
+import '../../../core/theme/app_theme.dart';
+import '../../../core/network/ai_chat_repository.dart';
+import '../../../core/network/ai_local_messages.dart';
+import '../../../core/risk_engine/risk_models.dart';
+import '../../../core/risk_engine/risk_provider.dart';
+import '../../../core/security/local_settings_service.dart';
+import '../../../core/storage/app_database.dart';
+import '../../../core/storage/database_provider.dart';
+import '../../../l10n/app_language.dart';
+import '../../../l10n/app_strings.dart';
+
+final chatSessionIdProvider = FutureProvider<String>((ref) async {
+  final db = ref.read(appDatabaseProvider);
+  return db.ensureDefaultSession();
+});
+
+final chatMessagesProvider = StreamProvider<List<ChatMessage>>((ref) async* {
+  final sessionId = await ref.watch(chatSessionIdProvider.future);
+  yield* ref.read(appDatabaseProvider).watchSessionMessages(sessionId);
+});
+
+class ChatPage extends ConsumerStatefulWidget {
+  const ChatPage({super.key});
+
+  @override
+  ConsumerState<ChatPage> createState() => _ChatPageState();
+}
+
+enum _TtsPlaybackState { stopped, playing, paused }
+
+class _ChatPageState extends ConsumerState<ChatPage> {
+  final TextEditingController _textController = TextEditingController();
+  final SpeechToText _speech = SpeechToText();
+  final FlutterTts _tts = FlutterTts();
+  bool _isSending = false;
+  bool _voiceInitialized = false;
+  bool _speechReady = false;
+  bool _isListening = false;
+  _TtsPlaybackState _ttsPlaybackState = _TtsPlaybackState.stopped;
+  int? _activeTtsMessageId;
+  String? _activeTtsText;
+  int _ttsProgressOffset = 0;
+  int _ttsSegmentStartOffset = 0;
+  final ScrollController _scrollController = ScrollController();
+
+  @override
+  void initState() {
+    super.initState();
+    // Voice features are lazy-loaded to prevent permissions crash on startup
+  }
+
+  Future<void> _ensureVoiceInitialized() async {
+    if (_voiceInitialized) return;
+
+    try {
+      _speechReady = await _speech.initialize(
+        onError: (e) => debugPrint('[ChatPage] STT Error: $e'),
+      );
+    } catch (e) {
+      debugPrint('[ChatPage] SpeechToText init failed: $e');
+      _speechReady = false;
+    }
+
+    try {
+      final speechRate = await ref.read(ttsSpeechRateProvider.future);
+      await _tts.awaitSpeakCompletion(true);
+      await _tts.setLanguage(
+        _ttsLanguageFor(ref.read(appLanguageControllerProvider)),
+      );
+      await _tts.setSpeechRate(speechRate);
+      await _tts.setPitch(1.0);
+      _tts.setStartHandler(() {
+        if (!mounted) return;
+        setState(() => _ttsPlaybackState = _TtsPlaybackState.playing);
+      });
+      _tts.setCompletionHandler(_handleTtsFinished);
+      _tts.setCancelHandler(_handleTtsFinished);
+      _tts.setPauseHandler(() {
+        if (!mounted) return;
+        setState(() => _ttsPlaybackState = _TtsPlaybackState.paused);
+      });
+      _tts.setContinueHandler(() {
+        if (!mounted) return;
+        setState(() => _ttsPlaybackState = _TtsPlaybackState.playing);
+      });
+      _tts.setErrorHandler((message) {
+        debugPrint('[ChatPage] FlutterTts error: $message');
+        _handleTtsFinished();
+      });
+      _tts.setProgressHandler((text, startOffset, endOffset, word) {
+        _ttsProgressOffset = (_ttsSegmentStartOffset + endOffset).clamp(
+          0,
+          _activeTtsText?.length ?? 0,
+        );
+      });
+    } catch (e) {
+      debugPrint('[ChatPage] FlutterTts init failed: $e');
+    }
+
+    _voiceInitialized = true;
+  }
+
+  Future<void> _applyTtsSpeechRate(double value) async {
+    if (!_voiceInitialized) return;
+
+    try {
+      await _tts.setSpeechRate(value);
+    } catch (e) {
+      debugPrint('[ChatPage] Failed to update TTS speech rate: $e');
+    }
+  }
+
+  @override
+  void dispose() {
+    _textController.dispose();
+    _speech.stop();
+    _tts.stop();
+    _scrollController.dispose();
+    super.dispose();
+  }
+
+  void _scrollToBottom() {
+    if (_scrollController.hasClients) {
+      _scrollController.animateTo(
+        _scrollController.position.maxScrollExtent + 100,
+        duration: const Duration(milliseconds: 300),
+        curve: Curves.easeOut,
+      );
+    }
+  }
+
+  bool get _isAndroidTts =>
+      !kIsWeb && defaultTargetPlatform == TargetPlatform.android;
+
+  bool _isActiveTtsMessage(ChatMessage msg) =>
+      _activeTtsMessageId == msg.id &&
+      _ttsPlaybackState != _TtsPlaybackState.stopped;
+
+  void _handleTtsFinished() {
+    if (!mounted) return;
+    setState(() {
+      _ttsPlaybackState = _TtsPlaybackState.stopped;
+      _activeTtsMessageId = null;
+      _activeTtsText = null;
+      _ttsProgressOffset = 0;
+      _ttsSegmentStartOffset = 0;
+    });
+  }
+
+  Future<void> _speakMessage(ChatMessage msg) async {
+    await _ensureVoiceInitialized();
+    await _tts.setLanguage(
+      _ttsLanguageFor(ref.read(appLanguageControllerProvider)),
+    );
+
+    if (_activeTtsMessageId != null && _activeTtsMessageId != msg.id) {
+      await _tts.stop();
+    }
+
+    final text = msg.content.trim();
+    if (text.isEmpty) return;
+
+    setState(() {
+      _activeTtsMessageId = msg.id;
+      _activeTtsText = text;
+      _ttsPlaybackState = _TtsPlaybackState.playing;
+      _ttsProgressOffset = 0;
+      _ttsSegmentStartOffset = 0;
+    });
+
+    final result = await _tts.speak(text);
+    if (result != 1 && mounted) {
+      _handleTtsFinished();
+    }
+  }
+
+  Future<void> _pauseSpeaking() async {
+    if (_ttsPlaybackState != _TtsPlaybackState.playing) return;
+    final result = await _tts.pause();
+    if (result == 1 && mounted) {
+      setState(() => _ttsPlaybackState = _TtsPlaybackState.paused);
+    }
+  }
+
+  Future<void> _resumeSpeaking() async {
+    final activeText = _activeTtsText;
+    if (_activeTtsMessageId == null || activeText == null) return;
+
+    final resumeOffset = _ttsProgressOffset.clamp(0, activeText.length);
+    if (resumeOffset >= activeText.length) {
+      _handleTtsFinished();
+      return;
+    }
+
+    final textToSpeak = _isAndroidTts
+        ? activeText
+        : activeText.substring(resumeOffset);
+
+    setState(() {
+      _ttsPlaybackState = _TtsPlaybackState.playing;
+      _ttsSegmentStartOffset = resumeOffset;
+    });
+
+    final result = await _tts.speak(textToSpeak);
+    if (result != 1 && mounted) {
+      _handleTtsFinished();
+    }
+  }
+
+  Future<void> _stopSpeaking() async {
+    final result = await _tts.stop();
+    if (result == 1 && mounted) {
+      _handleTtsFinished();
+    }
+  }
+
+  Future<void> _toggleListening() async {
+    await _ensureVoiceInitialized();
+    final language = ref.read(appLanguageControllerProvider);
+    final copy = AppStrings.of(language);
+
+    if (!_speechReady) {
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(copy.voiceUnavailable)));
+      }
+      return;
+    }
+
+    if (_isListening) {
+      await _speech.stop();
+      if (mounted) setState(() => _isListening = false);
+      return;
+    }
+
+    await _speech.listen(
+      localeId: _speechLocaleFor(language),
+      onResult: (result) {
+        setState(() {
+          _textController.text = result.recognizedWords;
+          _textController.selection = TextSelection.fromPosition(
+            TextPosition(offset: _textController.text.length),
+          );
+        });
+      },
+    );
+    if (mounted) setState(() => _isListening = true);
+  }
+
+  Future<void> _send() async {
+    if (_isSending) return;
+    final content = _textController.text.trim();
+    if (content.isEmpty) return;
+
+    setState(() => _isSending = true);
+
+    final db = ref.read(appDatabaseProvider);
+    final repository = ref.read(aiChatRepositoryProvider);
+    final riskService = ref.read(riskEvaluationServiceProvider);
+    final language = ref.read(appLanguageControllerProvider);
+    final copy = AppStrings.of(language);
+
+    try {
+      final sessionId = await ref.read(chatSessionIdProvider.future);
+
+      await db.insertChatMessage(
+        sessionId: sessionId,
+        role: 'user',
+        content: content,
+      );
+      _textController.clear();
+      _scrollToBottom();
+
+      final immediateRisk = await riskService.evaluateAndPersistToday(
+        sessionId: sessionId,
+      );
+      if (immediateRisk.riskLevel == RiskLevel.high) {
+        await db.insertChatMessage(
+          sessionId: sessionId,
+          role: 'ai',
+          content: aiHighRiskSafetyReplyFor(language),
+        );
+        _scrollToBottom();
+        if (mounted) {
+          await _showHighRiskSheet();
+        }
+        return;
+      }
+
+      final latestRisk = await db.getLatestRiskSnapshot();
+      String? contextSummary;
+      if (latestRisk != null) {
+        final reasons = (jsonDecode(latestRisk.reasonsJson) as List<dynamic>)
+            .map((e) => e.toString())
+            .join(language == AppLanguage.zhTw ? '、' : ', ');
+        contextSummary = copy.riskContext(latestRisk.riskLevel, reasons);
+      }
+
+      final reply = await repository.sendMessage(
+        sessionId: sessionId,
+        userText: content,
+        contextSummary: contextSummary,
+      );
+
+      await db.insertChatMessage(
+        sessionId: sessionId,
+        role: 'ai',
+        content: reply.content,
+      );
+      _scrollToBottom();
+      if (mounted && reply.warningMessage != null) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(reply.warningMessage!)));
+      }
+
+      final risk = await riskService.evaluateAndPersistToday(
+        sessionId: sessionId,
+      );
+      if (risk.riskLevel == RiskLevel.high && mounted) {
+        await _showHighRiskSheet();
+      }
+    } catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(copy.sendFailed(error))));
+      }
+    } finally {
+      if (mounted) setState(() => _isSending = false);
+    }
+  }
+
+  Future<void> _showHighRiskSheet() async {
+    final copy = AppStrings.of(ref.read(appLanguageControllerProvider));
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.white,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (context) {
+        return SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(24, 20, 24, 24),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    Icon(
+                      Icons.warning_amber_rounded,
+                      color: PsyGuardTheme.error,
+                      size: 22,
+                    ),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: Text(
+                        copy.highRiskDetected,
+                        style: TextStyle(
+                          fontSize: 16,
+                          fontWeight: FontWeight.w800,
+                          color: PsyGuardTheme.textPrimary,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 10),
+                Text(
+                  copy.highRiskSheetBody,
+                  style: TextStyle(
+                    fontSize: 13,
+                    height: 1.6,
+                    color: PsyGuardTheme.textSecondary,
+                  ),
+                ),
+                const SizedBox(height: 16),
+                SizedBox(
+                  width: double.infinity,
+                  height: 50,
+                  child: ElevatedButton(
+                    onPressed: () {
+                      Navigator.pop(context);
+                      this.context.go('/safety');
+                    },
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: PsyGuardTheme.error,
+                      foregroundColor: Colors.white,
+                      elevation: 0,
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(14),
+                      ),
+                    ),
+                    child: Text(copy.goToSafety),
+                  ),
+                ),
+                const SizedBox(height: 10),
+                SizedBox(
+                  width: double.infinity,
+                  height: 50,
+                  child: OutlinedButton(
+                    onPressed: () => Navigator.pop(context),
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: PsyGuardTheme.textPrimary,
+                      side: const BorderSide(color: Color(0xFFE5E7EB)),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(14),
+                      ),
+                    ),
+                    child: Text(copy.keepChatting),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final messages = ref.watch(chatMessagesProvider);
+    final theme = Theme.of(context);
+    final copy = AppStrings.of(ref.watch(appLanguageControllerProvider));
+
+    ref.listen<AsyncValue<double>>(ttsSpeechRateProvider, (previous, next) {
+      next.whenData(_applyTtsSpeechRate);
+    });
+
+    ref.listen(chatMessagesProvider, (prev, next) {
+      if (next.hasValue) {
+        Future.delayed(const Duration(milliseconds: 100), _scrollToBottom);
+      }
+    });
+
+    return Scaffold(
+      backgroundColor: PsyGuardTheme.background,
+      appBar: AppBar(
+        title: Text(copy.chatTitle),
+        leading: IconButton(
+          icon: const Icon(Icons.arrow_back_ios_new, size: 20),
+          onPressed: () => context.go('/home'),
+        ),
+      ),
+      body: Column(
+        children: [
+          Expanded(
+            child: messages.when(
+              data: (items) {
+                if (items.isEmpty) {
+                  return Center(
+                    child: Column(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        Container(
+                          padding: const EdgeInsets.all(24),
+                          decoration: BoxDecoration(
+                            color: Colors.white,
+                            border: Border.all(color: const Color(0xFFE5E7EB)),
+                            shape: BoxShape.circle,
+                          ),
+                          child: Icon(
+                            Icons.psychology_alt_rounded,
+                            size: 56,
+                            color: PsyGuardTheme.primary.withValues(alpha: 0.5),
+                          ),
+                        ),
+                        const SizedBox(height: 20),
+                        Text(
+                          copy.chatEmptyTitle,
+                          style: TextStyle(
+                            color: PsyGuardTheme.textSecondary,
+                            fontSize: 17,
+                            fontWeight: FontWeight.w500,
+                          ),
+                        ),
+                        const SizedBox(height: 6),
+                        Text(
+                          copy.chatEmptySubtitle,
+                          style: TextStyle(
+                            color: PsyGuardTheme.textLight,
+                            fontSize: 14,
+                          ),
+                        ),
+                      ],
+                    ),
+                  );
+                }
+                return ListView.builder(
+                  controller: _scrollController,
+                  padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
+                  itemCount: items.length,
+                  itemBuilder: (context, index) {
+                    final msg = items[index];
+                    final isUser = msg.role == 'user';
+                    return _buildMessageBubble(context, msg, isUser, copy);
+                  },
+                );
+              },
+              loading: () => const Center(
+                child: CircularProgressIndicator(color: PsyGuardTheme.primary),
+              ),
+              error: (error, stack) => Center(
+                child: Text(
+                  copy.loadFailed(error),
+                  style: theme.textTheme.bodyMedium,
+                ),
+              ),
+            ),
+          ),
+          _buildInputArea(context, copy),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildMessageBubble(
+    BuildContext context,
+    ChatMessage msg,
+    bool isUser,
+    AppStrings copy,
+  ) {
+    return Align(
+      alignment: isUser ? Alignment.centerRight : Alignment.centerLeft,
+      child: Container(
+        margin: const EdgeInsets.symmetric(vertical: 6),
+        constraints: BoxConstraints(
+          maxWidth: MediaQuery.of(context).size.width * 0.78,
+        ),
+        padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 14),
+        decoration: BoxDecoration(
+          color: isUser ? PsyGuardTheme.primary : Colors.white,
+          borderRadius: BorderRadius.only(
+            topLeft: const Radius.circular(22),
+            topRight: const Radius.circular(22),
+            bottomLeft: Radius.circular(isUser ? 22 : 6),
+            bottomRight: Radius.circular(isUser ? 6 : 22),
+          ),
+          boxShadow: [
+            BoxShadow(
+              color: (isUser ? PsyGuardTheme.primary : Colors.black).withValues(
+                alpha: 0.08,
+              ),
+              blurRadius: 12,
+              offset: const Offset(0, 4),
+            ),
+          ],
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              msg.content,
+              style: TextStyle(
+                color: isUser ? Colors.white : PsyGuardTheme.textPrimary,
+                fontSize: 15,
+                height: 1.6,
+              ),
+            ),
+            if (!isUser) ...[
+              const SizedBox(height: 8),
+              if (_isActiveTtsMessage(msg))
+                Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: [
+                    _buildTtsActionButton(
+                      icon: _ttsPlaybackState == _TtsPlaybackState.paused
+                          ? Icons.play_arrow_rounded
+                          : Icons.pause_rounded,
+                      label: _ttsPlaybackState == _TtsPlaybackState.paused
+                          ? copy.ttsResume
+                          : copy.ttsPause,
+                      onTap: _ttsPlaybackState == _TtsPlaybackState.paused
+                          ? _resumeSpeaking
+                          : _pauseSpeaking,
+                    ),
+                    _buildTtsActionButton(
+                      icon: Icons.stop_rounded,
+                      label: copy.ttsStop,
+                      onTap: _stopSpeaking,
+                    ),
+                  ],
+                )
+              else
+                _buildTtsActionButton(
+                  icon: Icons.volume_up_rounded,
+                  label: copy.ttsRead,
+                  onTap: () => _speakMessage(msg),
+                ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildTtsActionButton({
+    required IconData icon,
+    required String label,
+    required VoidCallback onTap,
+  }) {
+    return GestureDetector(
+      onTap: onTap,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+        decoration: BoxDecoration(
+          color: PsyGuardTheme.primary.withValues(alpha: 0.08),
+          borderRadius: BorderRadius.circular(8),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(icon, size: 14, color: PsyGuardTheme.primary),
+            const SizedBox(width: 4),
+            Text(
+              label,
+              style: TextStyle(
+                fontSize: 12,
+                color: PsyGuardTheme.primary,
+                fontWeight: FontWeight.w500,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildInputArea(BuildContext context, AppStrings copy) {
+    return Container(
+      padding: EdgeInsets.fromLTRB(
+        16,
+        12,
+        16,
+        MediaQuery.of(context).padding.bottom + 12,
+      ),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withValues(alpha: 0.04),
+            blurRadius: 16,
+            offset: const Offset(0, -4),
+          ),
+        ],
+      ),
+      child: Row(
+        children: [
+          // Mic button
+          GestureDetector(
+            onTap: _toggleListening,
+            child: Container(
+              padding: const EdgeInsets.all(10),
+              decoration: BoxDecoration(
+                color: _isListening
+                    ? PsyGuardTheme.error.withValues(alpha: 0.1)
+                    : PsyGuardTheme.primary.withValues(alpha: 0.1),
+                borderRadius: BorderRadius.circular(14),
+              ),
+              child: Icon(
+                _isListening ? Icons.mic_off_rounded : Icons.mic_rounded,
+                color: _isListening
+                    ? PsyGuardTheme.error
+                    : PsyGuardTheme.primary,
+                size: 22,
+              ),
+            ),
+          ),
+          const SizedBox(width: 10),
+          // Text input
+          Expanded(
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 16),
+              decoration: BoxDecoration(
+                color: PsyGuardTheme.background,
+                borderRadius: BorderRadius.circular(20),
+              ),
+              child: TextField(
+                controller: _textController,
+                maxLines: 4,
+                minLines: 1,
+                textInputAction: TextInputAction.send,
+                style: const TextStyle(
+                  fontSize: 15,
+                  color: PsyGuardTheme.textPrimary,
+                ),
+                decoration: InputDecoration(
+                  hintText: copy.chatHint,
+                  border: InputBorder.none,
+                  focusedBorder: InputBorder.none,
+                  enabledBorder: InputBorder.none,
+                  contentPadding: const EdgeInsets.symmetric(vertical: 12),
+                ),
+                onSubmitted: (_) => _send(),
+              ),
+            ),
+          ),
+          const SizedBox(width: 10),
+          // Send button
+          GestureDetector(
+            onTap: _isSending ? null : _send,
+            child: Container(
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: PsyGuardTheme.primary,
+                borderRadius: BorderRadius.circular(14),
+                boxShadow: [
+                  BoxShadow(
+                    color: PsyGuardTheme.primary.withValues(alpha: 0.3),
+                    blurRadius: 8,
+                    offset: const Offset(0, 3),
+                  ),
+                ],
+              ),
+              child: _isSending
+                  ? const SizedBox(
+                      width: 22,
+                      height: 22,
+                      child: CircularProgressIndicator(
+                        strokeWidth: 2,
+                        color: Colors.white,
+                      ),
+                    )
+                  : const Icon(
+                      Icons.send_rounded,
+                      color: Colors.white,
+                      size: 22,
+                    ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  String _ttsLanguageFor(AppLanguage language) {
+    return language == AppLanguage.zhTw ? 'zh-TW' : 'en-US';
+  }
+
+  String _speechLocaleFor(AppLanguage language) {
+    return language == AppLanguage.zhTw ? 'zh_TW' : 'en_US';
+  }
+}
